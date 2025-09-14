@@ -1,0 +1,127 @@
+name: Android CI
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 1) Descomprime el proyecto (el ZIP debe llamarse así)
+      - name: Unzip project
+        run: |
+          unzip PlantasSamuel_Starter.zip -d .
+          mv PlantasSamuel/* .
+          rm -rf PlantasSamuel
+
+      # 2) JDK 17
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      # 3) Android SDK manual con fallbacks
+      - name: Install Android SDK (cmdline-tools + packages con fallback)
+        env:
+          ANDROID_SDK_ROOT: ${{ runner.temp }}/android-sdk
+        run: |
+          set -e
+          mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
+          curl -sLo cmdline-tools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          unzip -q cmdline-tools.zip -d "$ANDROID_SDK_ROOT/cmdline-tools"
+          mv "$ANDROID_SDK_ROOT/cmdline-tools/cmdline-tools" "$ANDROID_SDK_ROOT/cmdline-tools/latest"
+          SDKMAN="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+
+          yes | "$SDKMAN" --sdk_root="$ANDROID_SDK_ROOT" --licenses
+
+          # Plataforma 34; si falla, pasar el proyecto a 33
+          if ! yes | "$SDKMAN" --sdk_root="$ANDROID_SDK_ROOT" "platforms;android-34" ; then
+            sed -i 's/compileSdk = 34/compileSdk = 33/' app/build.gradle.kts
+            sed -i 's/targetSdk = 34/targetSdk = 33/' app/build.gradle.kts
+            yes | "$SDKMAN" --sdk_root="$ANDROID_SDK_ROOT" "platforms;android-33"
+          fi
+
+          yes | "$SDKMAN" --sdk_root="$ANDROID_SDK_ROOT" "platform-tools"
+          yes | "$SDKMAN" --sdk_root="$ANDROID_SDK_ROOT" "build-tools;34.0.2" || \
+          yes | "$SDKMAN" --sdk_root="$ANDROID_SDK_ROOT" "build-tools;34.0.0" || \
+          yes | "$SDKMAN" --sdk_root="$ANDROID_SDK_ROOT" "build-tools;33.0.2"
+
+      # 4) Activar Compose (Kotlin 2.0) y ajustar compiler en :app
+      - name: Patch Kotlin/Compose (root + :app)
+        run: |
+          # Compiler de Compose compatible con Kotlin 2.0
+          sed -i 's/kotlinCompilerExtensionVersion = "1.5.15"/kotlinCompilerExtensionVersion = "1.6.10"/' app/build.gradle.kts || true
+
+          # build.gradle.kts (raíz): declarar plugin compose con versión si no existe
+          if ! grep -q 'org.jetbrains.kotlin.plugin.compose' build.gradle.kts; then
+            sed -i '/id("org.jetbrains.kotlin.android") version "2.0.0" apply false/a\    id("org.jetbrains.kotlin.plugin.compose") version "2.0.0" apply false' build.gradle.kts
+          fi
+
+          # app/build.gradle.kts: aplicar el plugin si no está aplicado
+          if ! grep -q 'org.jetbrains.kotlin.plugin.compose' app/build.gradle.kts; then
+            sed -i '/id("org.jetbrains.kotlin.android")/a\    id("org.jetbrains.kotlin.plugin.compose")' app/build.gradle.kts
+          fi
+
+      # 5) Habilitar AndroidX
+      - name: Enable AndroidX flags
+        run: |
+          if [ ! -f gradle.properties ]; then
+            printf "android.useAndroidX=true\nandroid.enableJetifier=true\norg.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8\nkotlin.code.style=official\n" > gradle.properties
+          else
+            grep -q '^android.useAndroidX=true' gradle.properties || echo 'android.useAndroidX=true' >> gradle.properties
+            grep -q '^android.enableJetifier=true' gradle.properties || echo 'android.enableJetifier=true' >> gradle.properties
+          fi
+
+      # 6) Añadir @file:OptIn(...) y @OptIn(...) para APIs experimentales
+      - name: Add OptIn annotations for experimental APIs
+        run: |
+          FILE=app/src/main/java/com/samuel/plantassamuel/MainActivity.kt
+
+          # Opt-in a nivel de archivo (antes de package)
+          if ! grep -q 'ExperimentalMaterial3Api' "$FILE"; then
+            TMP=$(mktemp)
+            printf "%s\n" "@file:OptIn(" \
+                           "  androidx.compose.material3.ExperimentalMaterial3Api::class," \
+                           "  androidx.compose.foundation.ExperimentalFoundationApi::class" \
+                           ")" > "$TMP"
+            printf "\n" >> "$TMP"
+            cat "$FILE" >> "$TMP"
+            mv "$TMP" "$FILE"
+          fi
+
+          # Opt-in sobre la función PlantasSamuelApp(), por si el file-level no basta
+          if grep -q '@Composable[[:space:]]*fun[[:space:]]*PlantasSamuelApp' "$FILE"; then
+            sed -i '/@Composable[[:space:]]*fun[[:space:]]*PlantasSamuelApp/ i @OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)' "$FILE"
+            sed -i '/@Composable[[:space:]]*fun[[:space:]]*PlantasSamuelApp/ i @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)' "$FILE"
+          fi
+
+      # 7) Forzar opt-in también desde el compilador (freeCompilerArgs)
+      - name: Force compiler opt-ins via Gradle
+        run: |
+          # Inserta los -opt-in dentro del bloque kotlinOptions { ... }
+          sed -i '/kotlinOptions[[:space:]]*{/,/}/ s/jvmTarget = "17"/jvmTarget = "17"\n        freeCompilerArgs += listOf(\n            "-opt-in=androidx.compose.material3.ExperimentalMaterial3Api",\n            "-opt-in=androidx.compose.foundation.ExperimentalFoundationApi"\n        )/' app/build.gradle.kts
+
+      # 8) Instalar Gradle 8.7 y compilar
+      - name: Install Gradle 8.7
+        run: |
+          curl -sLo gradle.zip https://services.gradle.org/distributions/gradle-8.7-bin.zip
+          mkdir -p $HOME/gradle && unzip -q gradle.zip -d $HOME/gradle
+          echo "$HOME/gradle/gradle-8.7/bin" >> $GITHUB_PATH
+
+      - name: Build Debug APK
+        env:
+          ANDROID_SDK_ROOT: ${{ runner.temp }}/android-sdk
+          ANDROID_HOME: ${{ runner.temp }}/android-sdk
+        run: gradle :app:assembleDebug --no-daemon
+
+      # 9) Publicar APK
+      - name: Publicar APK como artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
